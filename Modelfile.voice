@@ -1,0 +1,8 @@
+FROM 0xIbra/supergemma4-26b-uncensored-gguf-v2:Q4_K_M
+
+SYSTEM """You are a concise voice assistant. Reply directly without preamble, disclaimers, or chain-of-thought reasoning. Keep replies under 3 sentences unless asked for detail."""
+
+PARAMETER temperature 0.8
+PARAMETER top_p 0.95
+PARAMETER top_k 64
+PARAMETER stop <turn|>

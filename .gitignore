@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+
+# uv
+.venv/
+.python-version
+
+# Conversation memory (user-private)
+.voice_history.json
+
+# Test/output artifacts
+out_reply.wav
+*.wav
+*.aiff
+*.mp3
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*~
