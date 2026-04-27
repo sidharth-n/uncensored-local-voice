@@ -6,6 +6,14 @@ A handoff note. `/start` reads this and orients; `/end` rewrites it.
 
 ## Past
 
+### 2026-04-27 — Open-sourced on GitHub
+- Wrote public-facing `README.md` (setup, modes, env-var reference, hardware notes, gotchas, contribution asks).
+- Wrote `.gitignore` excluding `.venv/`, `__pycache__/`, `.voice_history.json` (private convo memory), audio test artifacts, logs.
+- `git init -b main`, staged 10 files, initial commit with co-author trailer.
+- Created public GitHub repo via `gh repo create`: **https://github.com/sidharth-n/uncensored-local-voice**
+- Pushed `main`. Repo description set, branch tracks origin.
+- Convention going forward: commit + push regularly during future sessions; `/end` should also push state.md updates.
+
 ### 2026-04-27 — Voice agent v1: AEC, barge-in, conversational replies
 - Researched + selected **SuperGemma4-26B-Uncensored** (Apr 2026 MoE, ~4B active) as the LLM. Pulled `0xIbra/supergemma4-26b-uncensored-gguf-v2:Q4_K_M` via Ollama. Smoke-tested: ~40 tok/s, no refusals.
 - Discovered Gemma 4 ships with **thinking mode ON** — first chat returned 80 tokens of empty `content`, all CoT in `thinking` field. Hard requirement to send `"think": false` in every `/api/chat` request (Modelfile param not supported yet, see [ollama/ollama#14809](https://github.com/ollama/ollama/issues/14809)).
@@ -45,4 +53,8 @@ A handoff note. `/start` reads this and orients; `/end` rewrites it.
 - **Multi-language: detect user language and switch system prompt.** Already mixes English + Malayalam acceptably; explicit detection would tighten it.
 - **Tool calls / agentic capabilities.** SuperGemma4 supports tool-use; voice agent could control local apps, file system, calendar, etc.
 - **Stream summarization mid-TTS.** Background-summarize older turns while the agent speaks the current one — zero added latency.
-- **Git init + GitHub.** Repo not initialized yet; user mentioned wanting `/end` to push if a remote exists. Decide on visibility (public/private) and create the repo when picking back up.
+
+### Repo hygiene
+- **Wire `/end` to auto-commit + push** state.md (and any in-progress code) at the end of each session. Currently manual.
+- **CI** for `uv run python -c "import voice_agent"` smoke check on push, so import-time regressions don't sneak in.
+- **CONTRIBUTING.md** + issue templates if external contributors show up.
