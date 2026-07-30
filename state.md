@@ -1,53 +1,79 @@
 # uncensored-local-voice — State
 
-_Last updated: 2026-07-27_
+_Last updated: 2026-07-30_
 
 ## Now
-- v1 shipped and stable (see `state-log.md` for build history). No code changes this session.
-- This session was **research**: found the July 2026 model landscape and upgrade path.
-- Branch `main`, clean, pushed.
+- Branch **`voice-stack-upgrade-2026-07`** (9 commits, all pushed). `main` untouched.
+- **Known-good config is `TURN_DETECTOR=off`** — Sid confirmed it works. Run it that way.
+- Stack now: **Parakeet TDT v3** STT (was Moonshine) · Kokoro TTS · Silero VAD
+  (min_silence 500 ms with detector off) · WebRTC AEC · SuperGemma4 LLM (untouched).
+- New: `issues/` tracker with **8 open issues** (3 urgent) — read `issues/README.md` first.
+- Last verified: 6/6 `scripts/smoke_multiturn.py`, full `smoke_pipeline.py` E2E, and a
+  real 10-turn conversation by Sid.
 
 ## Next
-1. **Model swap A/B test** — pull `tinyrick/Qwen3.6-35B-A3B-uncensored-heretic-vision-llmfan46:Q4_K_M`
-   (~20 GB, MoE 3B-active, ~60–70 tok/s expected vs current ~40) and compare against
-   SuperGemma4 with `scripts/smoke_pipeline.py` (TTFT, tok/s, refusals, coherence).
-   Fallbacks if the llmfan46 heretic shows coherence drops (one Reddit report):
-   `fredrezones55/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive` (69.8K pulls, but 4×
-   KL drift per the "Abliterlitics" forensic benchmark) or `HammerAI/gemma-4-26b-a4b-heretic`
-   (same base as current, ~16 GB, low-risk). Keep `"think": false` — Qwen3.6 is a
-   thinking model too.
-2. **TTS slot upgrade** — Qwen3-TTS (Jan 2026, 0.6B/1.7B): 97 ms streaming TTFA,
-   3-second voice cloning, voice design. Direct Kokoro replacement candidate; check for
-   an MLX port first.
-3. **Tool calling for the voice agent** (was a stretch goal; Qwen3.6 has reliable tool
-   calling) — voice controls Mac/calendar/files. Then optionally vision ("look at this").
-4. Existing tuning roadmap still valid: adaptive RMS gate · truncate barge-in'd partial
-   replies in history · macOS VoiceProcessingIO for stronger AEC · long-history
-   summarization · push-to-talk · session log · web status UI.
+1. **`issues/0003` — LLM swap.** Biggest remaining win and lowest risk: one-line,
+   reversible. `ollama pull huihui_ai/Qwen3.6-abliterated` (17 GB, same footprint as
+   today), then `uv run python scripts/bench_stack.py --slot llm --llm <old> --llm <new>`.
+   Target: first-sentence 977 ms → ~400 ms. **Do not enable MTP** (net loss on Metal).
+2. **`issues/0002` — inter-sentence gap.** Callback-driven output stream + ring buffer so
+   TTS generates ahead of playback. Must move the AEC reverse-stream feed carefully.
+3. **`issues/0001` — barge-in.** Do after 0002; they share the playback mechanism.
+4. `issues/0004` (STT slower in-pipeline than isolated — may be free latency), then
+   0007 / 0005 / 0006 / 0008.
 
 ## Blockers
-- None. (32 GB note: 20–22 GB Qwen model + Kokoro + Moonshine is tighter than today's
-  16 GB — if swap pressure appears, use Q4_K_S or the Gemma-4-26B option.)
+- None. Nothing is waiting on a decision.
 
-## Latest handoff — 2026-07-27 (research session, no code)
-- **Uncensored model landscape (researched via agent-reach):** Heretic
-  (github.com/p-e-w/heretic, v1.4.0) is now the standard abliteration tool; community
-  forensic benchmark ("Abliterlitics", r/LocalLLaMA) showed Heretic builds stay closest
-  to base (KL ≈ 0.06) while HauhauCS "aggressive" drifts ~4×. Mac sweet spot for
-  32–48 GB is **Qwen3.6-35B-A3B** (MoE, 3B active, 256K ctx, vision, tool calling);
-  uncensored GGUFs pullable from Ollama (tags in Next #1). OMLX + MTP reaches ~70 tok/s.
-- **Local capability map for this Mac (32 GB M5):** agents (Hermes Agent on local
-  Ollama — 24/7 Telegram assistant), local coding agents (Claude Code/OpenCode via
-  claude-code-router; context is the wall, ~64K working budget), overnight batch
-  (~1.4K summarizations/8 h for ~$0.14 power), private RAG, image gen (Draw Things /
-  Flux), music gen (ACE-Step 1.5), speech-to-speech (Moshi MLX). Video gen is the weak
-  slot (Wan 2.2 5B ≈ 47–97 min per 5 s clip on 32 GB). Modality details captured in the
-  2026-07-27 conversation; roadmap idea: formalize voice_agent stages as swappable
-  slots + tool belt.
-- **Spun off a new project: `livefunAI`** (~/Developer/Personal/livefunAI, private
-  GitHub) — live AI event entertainment (Decart realtime restyle + fal.ai I2V clips on
-  a video wall). Scaffolded, registered in the brain, MVP plan approved, Stage 0
-  (operator+wall shell, camera passthrough) built/verified/pushed. Work continues in
-  its own iTerm tab/session — not in this repo.
-- **First next session here:** run the model A/B (Next #1); it's a pure
-  `ollama pull` + env/model-name change + smoke test.
+## Latest handoff — 2026-07-30 (research + 9 commits, agent materially better but not "natural" yet)
+
+### What shipped
+Full research pass (agent-reach ×5 + monid/tikhub X pulls, $0.0165 spend) then a staged
+rebuild. Every number below was measured on **this M5**, not taken from a vendor page.
+
+| Slot | Before | After |
+|---|---|---|
+| STT | Moonshine, 396 ms, 17.8% WER | **Parakeet TDT v3, 74 ms isolated, 13.3% WER** |
+| Turn-taking | silence timeout only | Smart Turn v3.2 available (19 ms) — **default off** |
+| Threading | thread per turn | **one persistent worker** |
+| Barge-in | fixed RMS gate, no VAD check | VAD-gated + output-scaled gate (still wrong, see 0001) |
+
+Commits: `08c87ea` mlx-audio added · `abbfc17` engine slots · `e0874ce` bench harness ·
+`a04e245` Smart Turn · `de96969` fragmentation fix + STT engines · `71efaef` Parakeet
+default · `b8be6e1` GIL crash fix + multi-turn test · `20dfa9e` self-interruption /
+history / utterance cap · `0df0154` continuation bound + audio-length logging.
+
+### Key decisions and the evidence
+- **`mlx-audio` (⭐7650) is the single runtime for STT+TTS+VAD** — replaced what would
+  have been four separate packages. Installs clean on Python 3.13, so no venv rebuild.
+- **Parakeet over Nemotron/Whisper/Moonshine**, decided on a hard 45-word passage read
+  by Sid: nemotron 8.9% WER / 2174 ms, **parakeet 13.3% / 228 ms**, whisper 15.6% /
+  1183 ms, moonshine 17.8% / 1682 ms. Nemotron's margin is partly a scoring artifact
+  (it split the place name into two words = 2 errors for one mistake) and its 2.1 s
+  exceeds the whole latency budget. Parakeet was also the only engine to get "just buy
+  it" right. `STT_ENGINE=nemotron` remains available.
+- **The metric that matters is time-to-first-sentence, not TTFT** — TTS is driven per
+  sentence, so nothing is audible until a terminator arrives. TTFT 319 ms vs
+  first-sentence 977 ms; the gap is decode rate (16.1 tok/s). This reordered the plan.
+- **Malayalam deliberately parked** by Sid — findings preserved in `issues/0006`.
+
+### Corrections to earlier project claims (all were wrong in `CLAUDE.md`/`state.md`)
+- STT "~75 ms warm" → measured **351–396 ms** (Moonshine).
+- Kokoro "17× realtime" → measured **8.9–14.7×**, TTFA ~300 ms.
+- "MTP reaches ~70 tok/s" → **MTP is a net loss on Metal** (35B self-MTP collapses to
+  1.93 tok/s).
+- HauhauCS "~4× KL drift" → **6.5×**, and its tool is plagiarised from Heretic.
+- `<1 s warm` target → actual ~1.6 s isolated, 2.2–3.6 s TTFA live.
+- **`CLAUDE.md` still carries the wrong STT/TTS/MTP numbers — fix it next session.**
+
+### Process lesson (this cost Sid five test sessions)
+Three of my changes shipped clean through scripted tests and broke in live conversation:
+utterance fragmentation, a fatal GIL crash, and runaway buffers. Cause: component tests
+(`smoke_pipeline.py` = one turn, main thread) cannot catch interaction bugs.
+`scripts/smoke_multiturn.py` now covers multi-turn threading, but the real fix is
+**record conversations and replay offline** before enabling anything conversational —
+see `issues/0005`. Do not develop turn-taking by shipping to Sid and reading logs.
+
+### First thing next session
+Read `issues/README.md`. Then do `0003` (LLM swap) — it is isolated from the audio path,
+one env var to revert, and worth ~1 s off every reply. Leave `TURN_DETECTOR` off.

@@ -2,6 +2,28 @@
 
 Older session handoffs, newest first. Read on demand — `/start` only reads `state.md`.
 
+## 2026-07-27 — Research session (no code)
+- **Uncensored model landscape (researched via agent-reach):** Heretic
+  (github.com/p-e-w/heretic, v1.4.0) is now the standard abliteration tool; community
+  forensic benchmark ("Abliterlitics", r/LocalLLaMA) showed Heretic builds stay closest
+  to base (KL ≈ 0.06) while HauhauCS "aggressive" drifts ~4×. Mac sweet spot for
+  32–48 GB is **Qwen3.6-35B-A3B** (MoE, 3B active, 256K ctx, vision, tool calling);
+  uncensored GGUFs pullable from Ollama. OMLX + MTP reaches ~70 tok/s.
+  — *Corrected 2026-07-30: HauhauCS drift is 6.5× not 4×, and MTP is a net LOSS on
+  Metal. See `learning.md`.*
+- **Local capability map for this Mac (32 GB M5):** agents (Hermes Agent on local
+  Ollama), local coding agents (context is the wall, ~64K working budget), overnight
+  batch (~1.4K summarizations/8 h for ~$0.14 power), private RAG, image gen (Draw
+  Things / Flux), music gen (ACE-Step 1.5), speech-to-speech (Moshi MLX). Video gen is
+  the weak slot (Wan 2.2 5B ≈ 47–97 min per 5 s clip on 32 GB).
+- **Spun off a new project: `livefunAI`** (~/Developer/Personal/livefunAI, private
+  GitHub) — live AI event entertainment (Decart realtime restyle + fal.ai I2V clips on
+  a video wall). Scaffolded, registered in the brain, MVP plan approved, Stage 0
+  (operator+wall shell, camera passthrough) built/verified/pushed. Work continues in
+  its own iTerm tab/session — not in this repo.
+- Planned next: model A/B swap (pure `ollama pull` + env change + smoke test), TTS slot
+  upgrade to Qwen3-TTS, tool calling for the voice agent.
+
 ## 2026-04-27 — Open-sourced on GitHub
 - Wrote public-facing `README.md` (setup, modes, env-var reference, hardware notes, gotchas, contribution asks).
 - Wrote `.gitignore` excluding `.venv/`, `__pycache__/`, `.voice_history.json` (private convo memory), audio test artifacts, logs.
