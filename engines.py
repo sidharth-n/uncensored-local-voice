@@ -316,12 +316,24 @@ STT_MODELS = {
     "parakeet": "mlx-community/parakeet-tdt-0.6b-v3",
     "nemotron": "mlx-community/nemotron-3.5-asr-streaming-0.6b",
     "nemotron-8bit": "mlx-community/nemotron-3.5-asr-streaming-0.6b-8bit",
-    "whisper": "mlx-community/whisper-large-v3-turbo",
+    # -asr-fp16 rather than the more popular plain -turbo repo: that one ships
+    # only config.json + weights, and mlx-audio's whisper loader needs
+    # preprocessor_config.json + tokenizer to build a processor, so it fails
+    # with "Processor not found". This variant carries all 14 files.
+    "whisper": "mlx-community/whisper-large-v3-turbo-asr-fp16",
 }
 
 
 def build_stt() -> SttEngine:
-    choice = os.environ.get("STT_ENGINE", "moonshine").strip().lower()
+    # Default is parakeet, chosen on measurement rather than reputation. On an
+    # 8 s clip of the actual speaker, 5 runs each:
+    #     parakeet    74 ms median (73-76)   transcript correct
+    #     moonshine  396 ms median (385-399) transcript correct
+    #     nemotron   702 ms median (700-715) transcript correct
+    # Identical accuracy on the full utterance at 5.4x Moonshine's speed, and
+    # better on truncated audio (kept "tomorrow" where Moonshine substituted
+    # "today"). Moonshine stays one env var away.
+    choice = os.environ.get("STT_ENGINE", "parakeet").strip().lower()
     if choice == "moonshine":
         return MoonshineStt(
             language=os.environ.get("STT_LANGUAGE", "en"),
