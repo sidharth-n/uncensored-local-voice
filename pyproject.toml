@@ -10,6 +10,7 @@ dependencies = [
     "mlx-audio>=0.4.6",
     "moonshine-voice>=0.0.59",
     "numpy>=2.4.4",
+    "onnxruntime>=1.28.0",
     "silero-vad>=6.2.1",
     "sounddevice>=0.5.5",
 ]

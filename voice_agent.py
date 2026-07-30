@@ -200,12 +200,26 @@ class Models:
 
 
 def load_models() -> Models:
-    print("[1/5] Silero VAD...", flush=True)
+    # The silence timeout is a flat tax on every turn: we wait this long after
+    # you stop making noise before doing anything. With no semantic detector it
+    # has to be generous (500 ms) or natural mid-sentence pauses get treated as
+    # end-of-turn — and it still cuts people off, because silence duration says
+    # nothing about whether a sentence is finished.
+    #
+    # With a semantic detector in the loop, that job moves to the model, so the
+    # timeout only has to be long enough to catch a breath. 200 ms costs ~19 ms
+    # of inference and saves ~300 ms per turn.
+    turn_choice = os.environ.get("TURN_DETECTOR", "off").strip().lower()
+    semantic_turn = turn_choice not in ("off", "none", "0")
+    default_silence = "200" if semantic_turn else "500"
+    min_silence_ms = int(os.environ.get("VAD_MIN_SILENCE_MS", default_silence))
+
+    print(f"[1/5] Silero VAD (min_silence {min_silence_ms} ms)...", flush=True)
     vad = VADIterator(
         load_silero_vad(),
         threshold=float(os.environ.get("VAD_THRESHOLD", "0.6")),
         sampling_rate=SR,
-        min_silence_duration_ms=500,
+        min_silence_duration_ms=min_silence_ms,
         speech_pad_ms=100,
     )
 

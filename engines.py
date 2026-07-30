@@ -168,6 +168,86 @@ class NoTurnDetector:
         pass
 
 
+class SmartTurnDetector:
+    """Semantic end-of-turn detection via pipecat-ai/smart-turn v3.2 (ONNX).
+
+    An 8M-param Whisper-Tiny backbone with a classifier head, run on CPU
+    through onnxruntime. It answers "did this person finish their thought",
+    which Silero cannot: Silero only knows sound stopped, so the pipeline had
+    to wait out a fixed silence timeout and still cut people off on pauses.
+
+    We deliberately depend on the raw .onnx weights plus transformers'
+    WhisperFeatureExtractor rather than pulling in pipecat as a framework —
+    the model is BSD-2-Clause and the preprocessing is ~10 lines.
+
+    Cost: one inference per end-of-speech event, not per audio frame, so it
+    sits outside the 32 ms VAD loop entirely.
+
+    Note it covers 23 languages and Malayalam is not among them; worse, it
+    reads lexical content rather than pure prosody, so it should not be
+    assumed to generalize. `TURN_LANGUAGES` gates which languages use it.
+    """
+
+    name = "smartturn"
+
+    HF_REPO = "pipecat-ai/smart-turn-v3"
+    DEFAULT_FILE = "smart-turn-v3.2-cpu.onnx"
+    WINDOW_S = 8  # the model is trained on a fixed 8 s window at 16 kHz
+
+    def __init__(self, threshold: float = 0.5, filename: str | None = None) -> None:
+        import onnxruntime as ort
+        from huggingface_hub import hf_hub_download
+        from transformers import WhisperFeatureExtractor
+
+        self.threshold = threshold
+        path = hf_hub_download(
+            repo_id=self.HF_REPO, filename=filename or self.DEFAULT_FILE
+        )
+
+        # Single-threaded sequential execution: this runs on the audio thread
+        # between turns, and letting ORT spin up a thread pool per call costs
+        # more than the inference itself at this model size.
+        so = ort.SessionOptions()
+        so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        so.inter_op_num_threads = 1
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        self._session = ort.InferenceSession(path, sess_options=so)
+        self._fx = WhisperFeatureExtractor(chunk_length=self.WINDOW_S)
+        self.last_probability: float | None = None
+
+    def _window(self, audio_f32: np.ndarray) -> np.ndarray:
+        """Keep the last 8 s, or left-pad with silence to reach 8 s.
+
+        Left-padding matters: the decision is about how the utterance *ended*,
+        so the tail must stay anchored to the end of the window.
+        """
+        n = self.WINDOW_S * SR
+        if len(audio_f32) > n:
+            return audio_f32[-n:]
+        if len(audio_f32) < n:
+            return np.pad(audio_f32, (n - len(audio_f32), 0), mode="constant")
+        return audio_f32
+
+    def is_complete(self, audio_f32: np.ndarray) -> bool:
+        audio = self._window(np.asarray(audio_f32, dtype=np.float32))
+        inputs = self._fx(
+            audio,
+            sampling_rate=SR,
+            return_tensors="np",
+            padding="max_length",
+            max_length=self.WINDOW_S * SR,
+            truncation=True,
+            do_normalize=True,
+        )
+        feats = np.expand_dims(inputs.input_features.squeeze(0).astype(np.float32), 0)
+        prob = float(self._session.run(None, {"input_features": feats})[0][0].item())
+        self.last_probability = prob
+        return prob > self.threshold
+
+    def close(self) -> None:
+        self._session = None
+
+
 # ─────────────────────────────── registry ─────────────────────────────
 
 
@@ -196,6 +276,21 @@ def build_turn_detector() -> TurnDetector:
     choice = os.environ.get("TURN_DETECTOR", "off").strip().lower()
     if choice in ("off", "none", "0"):
         return NoTurnDetector()
+    if choice in ("smartturn", "smart_turn", "smart-turn"):
+        # Default 0.6 rather than the model's own 0.5. Two reasons, one solid
+        # and one weak, so treat it as a starting point and not a tuned value:
+        #
+        #  - Solid: the costs are asymmetric. Declaring "complete" too eagerly
+        #    talks over the user; declaring "incomplete" too eagerly just waits
+        #    a beat longer. Requiring more confidence to interrupt is right.
+        #  - Weak: on scripts/smoke_turn.py's 8 cases, 0.5 misses one trailing
+        #    "...I really want to" at p=0.530 and 0.6 gets all eight. That is 8
+        #    samples of synthetic speech, not evidence — the vendor calibrated
+        #    0.5 on 31,527 real samples. Revisit against your own voice.
+        return SmartTurnDetector(
+            threshold=float(os.environ.get("TURN_THRESHOLD", "0.6")),
+            filename=os.environ.get("SMART_TURN_FILE") or None,
+        )
     raise SystemExit(
-        f"unknown TURN_DETECTOR={choice!r}. available: off"
+        f"unknown TURN_DETECTOR={choice!r}. available: off, smartturn"
     )
