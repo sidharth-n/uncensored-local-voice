@@ -64,6 +64,12 @@ BARGE_IN_RMS_GATE = float(os.environ.get("BARGE_IN_RMS_GATE", "0.05"))
 # and ignoring brief noise blips.
 BARGE_IN_SUSTAIN_FRAMES = int(os.environ.get("BARGE_IN_SUSTAIN_FRAMES", "4"))
 
+# Shortest audio we will hand to STT. Below roughly this, a clip carries less
+# than a word and small ASR models return confident stock phrases instead of
+# nothing. Kept low enough that a genuine one-word "yes"/"no" still gets through.
+MIN_UTTERANCE_MS = int(os.environ.get("MIN_UTTERANCE_MS", "250"))
+MIN_UTTERANCE_SAMPLES = SR * MIN_UTTERANCE_MS // 1000
+
 HISTORY_FILE = Path(__file__).resolve().parent / ".voice_history.json"
 HISTORY_MAX_TURNS = int(os.environ.get("HISTORY_MAX_TURNS", "8"))
 
@@ -493,18 +499,33 @@ def main() -> int:
                 if event:
                     if "start" in event:
                         if not state["speaking"]:
+                            if active:
+                                # Already mid-utterance: the turn detector told
+                                # us the thought wasn't finished, so this is the
+                                # user resuming after a pause. Keep the buffer —
+                                # resetting it here drops everything said before
+                                # the pause and leaves STT decoding a fragment
+                                # too short to get right.
+                                speech_buf.append(v_chunk)
+                            else:
+                                speech_buf = [v_chunk]
+                                print("🎙  listening...", flush=True)
                             active = True
-                            speech_buf = [v_chunk]
-                            print("🎙  listening...", flush=True)
                     elif "end" in event and active:
                         speech_buf.append(v_chunk)
                         audio = np.concatenate(speech_buf)
+
+                        # Sub-word fragments make small STT models hallucinate
+                        # fluent nonsense rather than return nothing — "No.",
+                        # "Thank you." and similar stock phrases. Cheaper to
+                        # refuse to transcribe them than to filter them after.
+                        too_short = len(audio) < MIN_UTTERANCE_SAMPLES
 
                         # Silero says the sound stopped; the turn detector says
                         # whether the *thought* finished. If not, stay active so
                         # the continuation joins this same utterance instead of
                         # becoming a second, truncated one.
-                        if not models.turn.is_complete(audio):
+                        if too_short or not models.turn.is_complete(audio):
                             models.vad.reset_states()
                             continue
 

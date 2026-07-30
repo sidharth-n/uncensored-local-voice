@@ -118,6 +118,66 @@ class MoonshineStt:
             pass
 
 
+class MlxAudioStt:
+    """Any STT model in mlx-audio's registry, MLX-native on Apple Silicon.
+
+    Gives us Parakeet TDT v3 (25 European languages), Nemotron 3.5 ASR
+    (40 locales, language-ID prompting), Whisper, Canary and MMS behind one
+    adapter — all substantially larger and better-trained than Moonshine,
+    which is English-only and small enough to hallucinate on short clips.
+
+    mlx-audio's generate() takes a file path, so we spill the utterance to a
+    temp wav. At utterance rate that write is microseconds against hundreds of
+    milliseconds of inference, and it keeps us on the library's supported path
+    instead of reaching into its internals.
+    """
+
+    name = "mlxaudio"
+
+    def __init__(self, model_id: str, language: str | None = None) -> None:
+        from mlx_audio.stt import load
+
+        self.model_id = model_id
+        self.language = language
+        self.name = f"mlxaudio:{model_id.split('/')[-1]}"
+        self._model = load(model_id)
+
+    def transcribe(self, audio_f32: np.ndarray) -> str:
+        import tempfile
+        import wave
+
+        audio = np.asarray(audio_f32, dtype=np.float32)
+        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+        if peak > 1.0:  # keep within [-1, 1] before int16 conversion clips it
+            audio = audio / peak
+        pcm = (audio * 32767.0).astype(np.int16)
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
+            with wave.open(tmp.name, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(SR)
+                w.writeframes(pcm.tobytes())
+            kwargs = {"language": self.language} if self.language else {}
+            try:
+                result = self._model.generate(tmp.name, **kwargs)
+            except TypeError:
+                # not every model in the registry accepts a language kwarg
+                result = self._model.generate(tmp.name)
+
+        text = getattr(result, "text", None)
+        if text is None:  # some models yield segments instead of a flat string
+            segs = getattr(result, "segments", None) or []
+            text = " ".join(getattr(s, "text", "") or "" for s in segs)
+        return (text or "").strip()
+
+    def warmup(self) -> None:
+        self.transcribe(np.zeros(SR, dtype=np.float32))
+
+    def close(self) -> None:
+        self._model = None
+
+
 # ─────────────────────────────── TTS adapters ─────────────────────────
 
 
@@ -251,6 +311,15 @@ class SmartTurnDetector:
 # ─────────────────────────────── registry ─────────────────────────────
 
 
+# Shorthands so callers say STT_ENGINE=parakeet rather than pasting a repo id.
+STT_MODELS = {
+    "parakeet": "mlx-community/parakeet-tdt-0.6b-v3",
+    "nemotron": "mlx-community/nemotron-3.5-asr-streaming-0.6b",
+    "nemotron-8bit": "mlx-community/nemotron-3.5-asr-streaming-0.6b-8bit",
+    "whisper": "mlx-community/whisper-large-v3-turbo",
+}
+
+
 def build_stt() -> SttEngine:
     choice = os.environ.get("STT_ENGINE", "moonshine").strip().lower()
     if choice == "moonshine":
@@ -258,8 +327,14 @@ def build_stt() -> SttEngine:
             language=os.environ.get("STT_LANGUAGE", "en"),
             arch=os.environ.get("MOONSHINE_ARCH") or None,
         )
+    if choice in STT_MODELS or "/" in choice:
+        return MlxAudioStt(
+            model_id=STT_MODELS.get(choice, os.environ.get("STT_ENGINE", "")),
+            language=os.environ.get("STT_LANGUAGE") or None,
+        )
     raise SystemExit(
-        f"unknown STT_ENGINE={choice!r}. available: moonshine"
+        f"unknown STT_ENGINE={choice!r}. "
+        f"available: moonshine, {', '.join(STT_MODELS)}, or an mlx-audio repo id"
     )
 
 
