@@ -75,8 +75,15 @@ BARGE_IN_ECHO_FACTOR = float(os.environ.get("BARGE_IN_ECHO_FACTOR", "1.6"))
 # "not finished" lets the buffer grow without bound, and STT cost grows with it:
 # an unbounded buffer produced a single 11.5 s transcription against a 228 ms
 # benchmark. At the cap we stop waiting and transcribe what we have.
-MAX_UTTERANCE_S = float(os.environ.get("MAX_UTTERANCE_S", "20"))
+MAX_UTTERANCE_S = float(os.environ.get("MAX_UTTERANCE_S", "12"))
 MAX_UTTERANCE_SAMPLES = int(SR * MAX_UTTERANCE_S)
+
+# How many times the turn detector may say "not finished" before we stop
+# waiting. A duration cap alone is not enough: while waiting we keep appending
+# every frame, silence included, so an open-ended wait both grows the buffer and
+# delays the reply. Bounding the number of continuations bounds the wait
+# deterministically, regardless of how the detector behaves.
+MAX_TURN_CONTINUATIONS = int(os.environ.get("MAX_TURN_CONTINUATIONS", "2"))
 
 # Shortest audio we will hand to STT. Below roughly this, a clip carries less
 # than a word and small ASR models return confident stock phrases instead of
@@ -452,6 +459,7 @@ def main() -> int:
     vad_buf = np.zeros(0, dtype=np.float32)  # accumulates AEC'd audio for VAD
     speech_buf: list[np.ndarray] = []
     active = False
+    continuations = 0  # times the turn detector deferred the current utterance
     state = {
         "speaking": False,
         "tts_audible": False,
@@ -580,6 +588,7 @@ def main() -> int:
                                 speech_buf.append(v_chunk)
                             else:
                                 speech_buf = [v_chunk]
+                                continuations = 0  # fresh utterance
                                 print("🎙  listening...", flush=True)
                             active = True
                     elif "end" in event and active:
@@ -596,6 +605,7 @@ def main() -> int:
                         # if the turn detector still thinks there is more coming.
                         # STT cost scales with buffer length, so an uncapped
                         # buffer turns into runaway latency.
+                        forced = False
                         if len(audio) >= MAX_UTTERANCE_SAMPLES:
                             print(
                                 f"[utterance cap] {len(audio)/SR:.1f}s reached — "
@@ -604,8 +614,13 @@ def main() -> int:
                             )
                             too_short = False
                             forced = True
-                        else:
-                            forced = False
+                        elif continuations >= MAX_TURN_CONTINUATIONS:
+                            print(
+                                f"[turn cap] {continuations} continuations — "
+                                "transcribing now",
+                                flush=True,
+                            )
+                            forced = True
 
                         # Silero says the sound stopped; the turn detector says
                         # whether the *thought* finished. If not, stay active so
@@ -614,10 +629,12 @@ def main() -> int:
                         if not forced and (
                             too_short or not models.turn.is_complete(audio)
                         ):
+                            continuations += 1
                             models.vad.reset_states()
                             continue
 
                         active = False
+                        continuations = 0
                         state["speaking"] = True
                         state["tts_audible"] = False
                         state["user_just_ended"] = time.monotonic()
@@ -656,7 +673,14 @@ def respond(
     if not user_text:
         print("(no speech detected)", flush=True)
         return
-    print(f"You: {user_text}   [stt {t_stt*1000:.0f}ms]", flush=True)
+    # Log the audio length alongside the time. Without it, a slow STT reading is
+    # ambiguous between "the model is slow" and "we handed it far too much
+    # audio", and those have opposite fixes.
+    print(
+        f"You: {user_text}   "
+        f"[stt {t_stt*1000:.0f}ms on {len(audio)/SR:.1f}s]",
+        flush=True,
+    )
 
     history.append({"role": "user", "content": user_text})
     history[:] = trim_history(history)
