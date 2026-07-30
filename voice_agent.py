@@ -62,7 +62,21 @@ BARGE_IN_RMS_GATE = float(os.environ.get("BARGE_IN_RMS_GATE", "0.05"))
 # user speech will. 4 frames ≈ 128 ms — balance between catching real
 # interruptions (which AEC often partially attenuates during double-talk)
 # and ignoring brief noise blips.
-BARGE_IN_SUSTAIN_FRAMES = int(os.environ.get("BARGE_IN_SUSTAIN_FRAMES", "4"))
+BARGE_IN_SUSTAIN_FRAMES = int(os.environ.get("BARGE_IN_SUSTAIN_FRAMES", "6"))
+
+# Mic RMS must exceed this multiple of what the speaker is currently emitting
+# before we believe it is the user rather than residual echo. WebRTC AEC leaves
+# roughly a fixed fraction of the output signal behind, so the threshold has to
+# track output level instead of sitting at a constant. Lower it if real
+# interruptions get ignored; raise it if the agent still talks over itself.
+BARGE_IN_ECHO_FACTOR = float(os.environ.get("BARGE_IN_ECHO_FACTOR", "1.6"))
+
+# Hard ceiling on one utterance. Without it, a turn detector that keeps saying
+# "not finished" lets the buffer grow without bound, and STT cost grows with it:
+# an unbounded buffer produced a single 11.5 s transcription against a 228 ms
+# benchmark. At the cap we stop waiting and transcribe what we have.
+MAX_UTTERANCE_S = float(os.environ.get("MAX_UTTERANCE_S", "20"))
+MAX_UTTERANCE_SAMPLES = int(SR * MAX_UTTERANCE_S)
 
 # Shortest audio we will hand to STT. Below roughly this, a clip carries less
 # than a word and small ASR models return confident stock phrases instead of
@@ -319,6 +333,14 @@ class TTSPlayer:
         self.stream.start()
         self._cancel = threading.Event()
         self._lock = threading.Lock()
+        # Exponential moving average of what we are sending to the speaker.
+        # The barge-in gate uses this to scale itself with echo, so it must be
+        # cheap and updated on every frame we actually write.
+        self._out_rms = 0.0
+
+    def output_rms(self) -> float:
+        """Recent RMS of audio sent to the speaker; 0.0 when silent."""
+        return self._out_rms
 
     def is_active(self) -> bool:
         with self._lock:
@@ -351,12 +373,14 @@ class TTSPlayer:
                         samples_per_channel=APM_FRAME,
                     )
                     self.apm.process_reverse_stream(af)
+                self._note_output(frame_f32)
                 self.stream.write(frame_i16)
             residual = buf[n_full * APM_FRAME :]
 
         if len(residual) > 0 and not cancel.is_set():
             pad = np.zeros(APM_FRAME - len(residual), dtype=np.float32)
-            frame_i16 = f32_to_i16(np.concatenate([residual, pad]))
+            tail = np.concatenate([residual, pad])
+            frame_i16 = f32_to_i16(tail)
             if self.apm is not None:
                 af = AudioFrame(
                     data=frame_i16.tobytes(),
@@ -365,7 +389,19 @@ class TTSPlayer:
                     samples_per_channel=APM_FRAME,
                 )
                 self.apm.process_reverse_stream(af)
+            self._note_output(tail)
             self.stream.write(frame_i16)
+
+    def _note_output(self, frame_f32: np.ndarray) -> None:
+        """Fold one outgoing frame into the output-level estimate.
+
+        Asymmetric smoothing: rise fast so the gate is already high when the
+        agent starts talking, decay slower so it stays high through the brief
+        dips between words rather than dropping and admitting an echo spike.
+        """
+        r = float(np.sqrt(np.mean(frame_f32**2)))
+        alpha = 0.5 if r > self._out_rms else 0.05
+        self._out_rms = (1 - alpha) * self._out_rms + alpha * r
 
     def stop(self) -> None:
         self._cancel.set()
@@ -487,18 +523,33 @@ def main() -> int:
                 v_chunk = vad_buf[:VAD_FRAME]
                 vad_buf = vad_buf[VAD_FRAME:]
 
-                # Track sustained loud-frame streaks for barge-in. We compare
-                # RMS on every VAD frame (32 ms). A real user voice mid-reply
-                # produces a long streak; AEC residual produces brief spikes.
                 rms = float(np.sqrt(np.mean(v_chunk**2)))
-                if rms >= BARGE_IN_RMS_GATE:
+
+                # VAD runs before the barge-in check, not after, because the
+                # barge-in decision needs to know whether this frame is speech
+                # at all. Previously it did not: the condition was pure energy
+                # while its comment claimed VAD agreement, and the agent's own
+                # voice leaking past AEC cut 7 of 13 replies in testing.
+                event = models.vad(torch.from_numpy(v_chunk), return_seconds=False)
+                is_speech = bool(getattr(models.vad, "triggered", False))
+
+                # Adaptive gate. Residual echo scales with what the speaker is
+                # actually emitting, so a fixed floor cannot separate "user
+                # talking" from "our own output leaking" — measured false
+                # triggers ranged 0.058-0.152, straddling any single threshold.
+                # Requiring the mic to exceed a multiple of concurrent TTS
+                # output makes the bar rise exactly when leakage does.
+                gate = BARGE_IN_RMS_GATE
+                if state["tts_audible"]:
+                    gate = max(gate, BARGE_IN_ECHO_FACTOR * player.output_rms())
+
+                if rms >= gate and is_speech:
                     state["loud_streak"] += 1
                 else:
                     state["loud_streak"] = 0
 
-                # Mid-TTS barge-in: if user has been loud for N consecutive
-                # frames AND VAD currently agrees there's speech, cut the reply.
-                # `barge_fired` disarms repeats; we re-arm when the next reply starts.
+                # Mid-TTS barge-in. `barge_fired` disarms repeats; we re-arm
+                # when the next reply starts.
                 if (
                     state["speaking"]
                     and state["tts_audible"]
@@ -507,7 +558,8 @@ def main() -> int:
                     and time.monotonic() - state["user_just_ended"] >= POST_USER_BARGE_LOCKOUT_S
                 ):
                     print(
-                        f"[barge-in] cutting reply (rms={rms:.3f} streak={state['loud_streak']})",
+                        f"[barge-in] cutting reply (rms={rms:.3f} gate={gate:.3f} "
+                        f"streak={state['loud_streak']})",
                         flush=True,
                     )
                     llm_cancel.set()
@@ -515,7 +567,6 @@ def main() -> int:
                     state["loud_streak"] = 0
                     state["barge_fired"] = True
 
-                event = models.vad(torch.from_numpy(v_chunk), return_seconds=False)
                 if event:
                     if "start" in event:
                         if not state["speaking"]:
@@ -541,11 +592,28 @@ def main() -> int:
                         # refuse to transcribe them than to filter them after.
                         too_short = len(audio) < MIN_UTTERANCE_SAMPLES
 
+                        # Stop waiting once the utterance hits the ceiling, even
+                        # if the turn detector still thinks there is more coming.
+                        # STT cost scales with buffer length, so an uncapped
+                        # buffer turns into runaway latency.
+                        if len(audio) >= MAX_UTTERANCE_SAMPLES:
+                            print(
+                                f"[utterance cap] {len(audio)/SR:.1f}s reached — "
+                                "transcribing now",
+                                flush=True,
+                            )
+                            too_short = False
+                            forced = True
+                        else:
+                            forced = False
+
                         # Silero says the sound stopped; the turn detector says
                         # whether the *thought* finished. If not, stay active so
                         # the continuation joins this same utterance instead of
                         # becoming a second, truncated one.
-                        if too_short or not models.turn.is_complete(audio):
+                        if not forced and (
+                            too_short or not models.turn.is_complete(audio)
+                        ):
                             models.vad.reset_states()
                             continue
 
@@ -598,18 +666,25 @@ def respond(
     first_audio_at: float | None = None
     t1 = time.perf_counter()
 
+    interrupted = False
     try:
         for sent in sentence_stream(stream_llm(history, models.client, cancel)):
             if cancel.is_set():
+                interrupted = True
                 break
             print(sent + " ", end="", flush=True)
-            full_reply.append(sent)
             if first_audio_at is None:
                 first_audio_at = time.perf_counter() - t1
             state["tts_audible"] = True   # audio is now hitting the speaker; barge-in legit
             player.speak_sentence(sent)
             if cancel.is_set():
+                # Cut mid-sentence: the user heard part of this one at most, so
+                # recording it as spoken would put words in the agent's mouth
+                # that were never heard, and the model would then reason from a
+                # reply the user never got.
+                interrupted = True
                 break
+            full_reply.append(sent)
     except Exception as e:
         print(f"\n[error] {e}", flush=True)
 
@@ -618,7 +693,13 @@ def respond(
         print(f"[ttfa {first_audio_at*1000:.0f}ms]", flush=True)
 
     if full_reply:
-        history.append({"role": "assistant", "content": " ".join(full_reply)})
+        text = " ".join(full_reply)
+        if interrupted:
+            # Mark it so the model knows it was cut off rather than believing it
+            # delivered a complete thought — otherwise the next turn continues
+            # from a reply that only half happened, which reads as non-sequitur.
+            text += " …(interrupted)"
+        history.append({"role": "assistant", "content": text})
         save_history(history)
 
 
