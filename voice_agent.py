@@ -231,11 +231,16 @@ def load_models() -> Models:
 
     # Print before building, not after: loading a model can take tens of
     # seconds (or download gigabytes on first run) and silence reads as a hang.
-    print(f"[2/5] STT: {os.environ.get('STT_ENGINE', 'moonshine')}...", flush=True)
+    # Print the engine's own name after building, never a hardcoded guess at
+    # the default — that drifts the moment a default changes and silently
+    # misreports which model is actually running.
+    print(f"[2/5] STT: {os.environ.get('STT_ENGINE', '(default)')} loading...", flush=True)
     stt = build_stt()
+    print(f"      -> {stt.name}", flush=True)
 
-    print(f"[3/5] TTS: {os.environ.get('TTS_ENGINE', 'kokoro')}...", flush=True)
+    print(f"[3/5] TTS: {os.environ.get('TTS_ENGINE', '(default)')} loading...", flush=True)
     tts = build_tts()
+    print(f"      -> {tts.name} @ {tts.sample_rate} Hz", flush=True)
 
     print(f"[4/5] turn detector: {os.environ.get('TURN_DETECTOR', 'off')}", flush=True)
     turn = build_turn_detector()
@@ -427,14 +432,29 @@ def main() -> int:
     # trips VAD and instantly cancels the agent's reply before it can speak.
     POST_USER_BARGE_LOCKOUT_S = 0.6
 
-    def respond_thread(audio_buf):
-        try:
-            respond(audio_buf, models, history, player, llm_cancel, state)
-        finally:
-            state["resume_at"] = time.monotonic() + TTS_TAIL_GRACE_MS / 1000.0
-            state["speaking"] = False
-            state["tts_audible"] = False
-            models.vad.reset_states()
+    # One long-lived worker handles every turn, rather than a thread per turn.
+    # MLX keeps thread-local Metal state, and tearing that down when a thread
+    # exits crashes the interpreter outright:
+    #   Fatal Python error: PyThreadState_Get: ... the GIL is released
+    # A thread per turn therefore died on the second turn once the STT slot
+    # held an MLX model (Kokoro alone had tolerated it). Reproduced both ways:
+    # per-turn threads crash at turn 1->2, a persistent worker ran 8/8 clean.
+    turn_q: queue.Queue = queue.Queue()
+
+    def turn_worker():
+        while True:  # never returns — exiting is precisely what crashes
+            audio_buf, cancel = turn_q.get()
+            try:
+                respond(audio_buf, models, history, player, cancel, state)
+            except Exception as e:  # one bad turn must not kill the worker
+                print(f"\n[turn failed] {type(e).__name__}: {e}", flush=True)
+            finally:
+                state["resume_at"] = time.monotonic() + TTS_TAIL_GRACE_MS / 1000.0
+                state["speaking"] = False
+                state["tts_audible"] = False
+                models.vad.reset_states()
+
+    threading.Thread(target=turn_worker, daemon=True).start()
 
     try:
         while True:
@@ -536,9 +556,7 @@ def main() -> int:
                         state["loud_streak"] = 0
                         state["barge_fired"] = False  # re-arm for the new reply
                         llm_cancel = threading.Event()
-                        threading.Thread(
-                            target=respond_thread, args=(audio,), daemon=True
-                        ).start()
+                        turn_q.put((audio, llm_cancel))
                         models.vad.reset_states()
                 elif active:
                     speech_buf.append(v_chunk)
