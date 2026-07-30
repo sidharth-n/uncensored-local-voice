@@ -5,6 +5,51 @@ how the project gets smarter rather than repeating itself.
 
 ---
 
+## 2026-07-30 · Check the premise of a plan before executing it, not just the steps
+
+**Context:** `issues/0003` said "the LLM is slow because it's dense — swap in a sparse
+3B-active MoE, expect ~3.7x". The plan was detailed, evidenced, and marked urgent. The
+model we were already running turned out to *be* a sparse MoE (`expert_count = 128`,
+`expert_used_count = 8`, 100% GPU) that simply decodes at dense speed. The whole issue
+was "replace X with Y" where we already had Y. A control run confirmed it: a second
+same-class GGUF landed at 13.0 tok/s vs 12.5 — inside the noise.
+
+**Rule:** Before executing a written plan — including one this project wrote itself —
+spend the five minutes to verify its central factual claim against the artifact in
+front of you. A plan's steps get scrutiny because they're what you're about to type;
+its premise sits above them and gets read as given. Ask "is the thing this says is
+true, actually true here?" `ollama show` / model metadata / `ollama ps` answer it
+faster than any benchmark.
+
+**Example:** Three claims in 0003 were also false — the recommended tag has no
+`latest` and cannot be pulled at all, its real size is 23.94 GB not 17 GB (on this
+32 GB machine that exceeds the ~24 GiB GPU wired limit and would have run *slower*),
+and the 17 GB figure belonged to a dense variant. This is the same failure the
+"verify subagent research findings" lesson below describes, surviving into a written,
+prioritised issue — so the check has to happen at execution time too, not only when
+the research lands.
+
+---
+
+## 2026-07-30 · A faster number in one column can still be a slower agent
+
+**Context:** MLX decoded 20% faster than llama.cpp (18.3 vs 15.2 tok/s) — the metric
+0003 was explicitly optimising. It was still the wrong choice: its prompt *prefill*
+ran at 51–60 tok/s. With `HISTORY_MAX_TURNS=8` the prompt grows every turn, so the
+agent would have got slower the longer you talked to it. The win column was real and
+irrelevant.
+
+**Rule:** When benchmarking a swap, measure every stage the change touches, including
+the ones the current setup is silently good at. A regression hides in the column you
+didn't think to print — especially costs that scale with conversation length, since a
+fresh-prompt benchmark never sees them.
+
+**Example:** `bench_llm_mlx.py` originally reported TTFT / first-sentence / decode. It
+took a separate probe with a 17-token prompt to expose `prompt_tps`, which is what
+actually killed the option.
+
+---
+
 ## 2026-07-30 · Component tests cannot catch conversation bugs
 
 **Context:** Three changes shipped clean through every scripted test and broke immediately
