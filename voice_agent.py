@@ -27,12 +27,17 @@ import httpx
 import numpy as np
 import sounddevice as sd
 import torch
-from kokoro_mlx import DEFAULT_VOICE, KokoroTTS
 from livekit.rtc import AudioFrame, AudioProcessingModule
-from moonshine_voice import get_model_for_language
-from moonshine_voice.moonshine_api import ModelArch
-from moonshine_voice.transcriber import Transcriber
 from silero_vad import VADIterator, load_silero_vad
+
+from engines import (
+    SttEngine,
+    TtsEngine,
+    TurnDetector,
+    build_stt,
+    build_tts,
+    build_turn_detector,
+)
 
 # ─────────────────────────────── config ───────────────────────────────
 
@@ -146,14 +151,8 @@ def sentence_stream(token_iter):
 # ─────────────────────────────── STT ──────────────────────────────────
 
 
-def transcribe_utterance(stt: Transcriber, audio_f32: np.ndarray) -> str:
-    transcript = stt.transcribe_without_streaming(audio_f32.tolist(), sample_rate=SR)
-    parts = []
-    for line in getattr(transcript, "lines", []) or []:
-        text = getattr(line, "text", "") or ""
-        if text.strip():
-            parts.append(text.strip())
-    return " ".join(parts).strip()
+def transcribe_utterance(stt: SttEngine, audio_f32: np.ndarray) -> str:
+    return stt.transcribe(audio_f32)
 
 
 # ─────────────────────────────── memory ───────────────────────────────
@@ -193,14 +192,15 @@ def trim_history(history: list[dict]) -> list[dict]:
 @dataclass
 class Models:
     vad: VADIterator
-    stt: Transcriber
-    tts: KokoroTTS
+    stt: SttEngine
+    tts: TtsEngine
+    turn: TurnDetector
     apm: AudioProcessingModule | None
     client: httpx.Client
 
 
 def load_models() -> Models:
-    print("[1/4] Silero VAD...", flush=True)
+    print("[1/5] Silero VAD...", flush=True)
     vad = VADIterator(
         load_silero_vad(),
         threshold=float(os.environ.get("VAD_THRESHOLD", "0.6")),
@@ -209,20 +209,20 @@ def load_models() -> Models:
         speech_pad_ms=100,
     )
 
-    print("[2/4] Moonshine STT (MEDIUM_STREAMING)...", flush=True)
-    # MEDIUM is more accurate than BASE; STT is well under our latency budget so
-    # we can spend tokens on quality. _STREAMING variant works fine for our
-    # one-shot `transcribe_without_streaming` calls too.
-    stt_path, stt_arch = get_model_for_language("en", ModelArch.MEDIUM_STREAMING)
-    stt = Transcriber(model_path=str(stt_path), model_arch=stt_arch)
-    stt.start()
+    # Print before building, not after: loading a model can take tens of
+    # seconds (or download gigabytes on first run) and silence reads as a hang.
+    print(f"[2/5] STT: {os.environ.get('STT_ENGINE', 'moonshine')}...", flush=True)
+    stt = build_stt()
 
-    print("[3/4] Kokoro TTS (MLX)...", flush=True)
-    tts = KokoroTTS.from_pretrained()
+    print(f"[3/5] TTS: {os.environ.get('TTS_ENGINE', 'kokoro')}...", flush=True)
+    tts = build_tts()
+
+    print(f"[4/5] turn detector: {os.environ.get('TURN_DETECTOR', 'off')}", flush=True)
+    turn = build_turn_detector()
 
     apm = None
     if not HALF_DUPLEX_ONLY:
-        print(f"[4/4] WebRTC AEC (stream delay {STREAM_DELAY_MS} ms)...", flush=True)
+        print(f"[5/5] WebRTC AEC (stream delay {STREAM_DELAY_MS} ms)...", flush=True)
         # AEC + HPF only. Reasoning:
         # - AEC removes the agent's voice from the mic.
         # - NS, when on, was damaging real user speech (Moonshine garbles its
@@ -241,14 +241,14 @@ def load_models() -> Models:
         print("[4/4] AEC disabled (HALF_DUPLEX=1)", flush=True)
 
     client = httpx.Client(timeout=httpx.Timeout(120.0))
-    return Models(vad=vad, stt=stt, tts=tts, apm=apm, client=client)
+    return Models(vad=vad, stt=stt, tts=tts, turn=turn, apm=apm, client=client)
 
 
 def warmup(models: Models) -> None:
     print("warming up...", flush=True)
     t0 = time.perf_counter()
 
-    transcribe_utterance(models.stt, np.zeros(SR, dtype=np.float32))
+    models.stt.warmup()
 
     try:
         models.client.post(
@@ -266,8 +266,7 @@ def warmup(models: Models) -> None:
     except Exception as e:
         print(f"  (LLM warmup: {e})")
 
-    for _ in models.tts.generate_stream("Hi.", voice=DEFAULT_VOICE):
-        pass
+    models.tts.warmup()
 
     print(f"  warmed in {(time.perf_counter()-t0)*1000:.0f}ms", flush=True)
 
@@ -284,10 +283,10 @@ class TTSPlayer:
     24 kHz output down to 16 kHz once, then write it both ways in lockstep.
     """
 
-    def __init__(self, tts: KokoroTTS, apm: AudioProcessingModule | None):
+    def __init__(self, tts: TtsEngine, apm: AudioProcessingModule | None):
         self.tts = tts
         self.apm = apm
-        self.in_sr = tts.SAMPLE_RATE  # 24000
+        self.in_sr = tts.sample_rate  # 24000 for Kokoro and the mlx-audio models
         self.out_sr = SR  # 16000
         self.stream = sd.OutputStream(
             samplerate=self.out_sr, channels=1, dtype="int16", blocksize=APM_FRAME
@@ -306,10 +305,9 @@ class TTSPlayer:
             cancel = self._cancel
 
         residual = np.zeros(0, dtype=np.float32)
-        for chunk in self.tts.generate_stream(sentence, voice=self.voice):
+        for arr in self.tts.stream(sentence):
             if cancel.is_set():
                 return
-            arr = np.asarray(chunk, dtype=np.float32).flatten()
             if self.in_sr != self.out_sr:
                 arr = linear_resample(arr, self.in_sr, self.out_sr).astype(np.float32)
             buf = np.concatenate([residual, arr])
@@ -343,8 +341,6 @@ class TTSPlayer:
                 )
                 self.apm.process_reverse_stream(af)
             self.stream.write(frame_i16)
-
-    voice = DEFAULT_VOICE
 
     def stop(self) -> None:
         self._cancel.set()
@@ -487,9 +483,18 @@ def main() -> int:
                             speech_buf = [v_chunk]
                             print("🎙  listening...", flush=True)
                     elif "end" in event and active:
-                        active = False
                         speech_buf.append(v_chunk)
                         audio = np.concatenate(speech_buf)
+
+                        # Silero says the sound stopped; the turn detector says
+                        # whether the *thought* finished. If not, stay active so
+                        # the continuation joins this same utterance instead of
+                        # becoming a second, truncated one.
+                        if not models.turn.is_complete(audio):
+                            models.vad.reset_states()
+                            continue
+
+                        active = False
                         state["speaking"] = True
                         state["tts_audible"] = False
                         state["user_just_ended"] = time.monotonic()
@@ -510,8 +515,9 @@ def main() -> int:
         in_stream.stop()
         in_stream.close()
         player.close()
-        models.stt.stop()
         models.stt.close()
+        models.tts.close()
+        models.turn.close()
     return 0
 
 
