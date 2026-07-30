@@ -4,13 +4,14 @@ Why this exists: every component in the pipeline (STT, TTS, end-of-turn) is a
 model choice we want to A/B on real hardware, not a permanent decision. Each
 slot is a small protocol plus one adapter per backend, selected by an env var.
 
-The defaults reproduce the original hard-wired pipeline exactly — Moonshine STT,
-Kokoro TTS, no semantic turn detection — so an unset environment behaves
-identically to before this module existed.
+The defaults are the known-good shipped config. STT moved to Parakeet on
+measurement (see build_stt); Moonshine, the original pick, stays one env var
+away. Turn detection defaults off deliberately — see issues/0005.
 
-    STT_ENGINE=moonshine   (default)
+    STT_ENGINE=parakeet    (default; also moonshine, nemotron, nemotron-8bit,
+                            whisper, or any mlx-audio repo id)
     TTS_ENGINE=kokoro      (default)
-    TURN_DETECTOR=off      (default)
+    TURN_DETECTOR=off      (default; also smartturn)
 """
 
 from __future__ import annotations
