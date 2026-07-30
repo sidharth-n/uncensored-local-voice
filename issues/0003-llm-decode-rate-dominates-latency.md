@@ -88,7 +88,54 @@ Consistent with `learning.md` "verify subagent research findings before acting":
 3. The 17 GB figure matches the `27b` tag (17.42 GB), which is **dense** (no
    `-a3b`) and so defeats the entire premise.
 
-### Where this now points
+### Result: MLX via mlx-lm is also not the answer
+
+`mlx-community/gemma-4-26B-A4B-it-heretic-4bit`, clean run with Ollama unloaded
+(it OOMs the GPU otherwise — `kIOGPUCommandBufferCallbackErrorOutOfMemory`):
+
+| | GGUF / llama.cpp (current) | MLX / mlx-lm |
+|---|---|---|
+| decode | 15.2 tok/s | **18.3 tok/s** (+20%) |
+| TTFT | **276 ms** | 529–1077 ms (2–4× worse) |
+| prompt processing | (fast) | **51–60 tok/s — catastrophic** |
+
+Decode is genuinely ~20% faster, and that is the only thing that improved. It
+does not come close to the 3.7× this issue projected, and it is bought at the
+price of prompt processing so slow it disqualifies the runtime for this
+pipeline: with `HISTORY_MAX_TURNS=8` the prompt grows every turn, so at ~55
+tok/s prefill the cost climbs *as the conversation goes on*. That is the
+opposite of what a voice agent needs. Verified on a 17-token prompt, warm, 3
+trials — this is inherent to mlx-lm's prefill, not a cold-start artifact.
+
+**Also disqualifying, independent of speed:** this model opens a
+`<|channel>thought` block on every single generation, even for a bare "Hi" with
+no system prompt. Its chat template suppresses thinking correctly (with thinking
+off it pre-fills an empty closed `<|channel>thought\n<channel|>`) and the model
+ignores it — the heretic ablation appears to have damaged that behaviour. There
+is no `think: false` equivalent in mlx-lm to force it. See gotcha 1 in
+CLAUDE.md; a voice agent cannot ship this.
+
+Two false leads worth not repeating: the first MLX run was invalid because
+`apply_chat_template(tokenize=False)` + `stream_generate(str)` double-prepends
+BOS — pass token ids. And Ollama must be unloaded (`ollama stop <model>`) before
+any MLX bench, or it OOMs at 19 GB resident.
+
+### Verdict on this issue
+
+Both tested levers are dead: **GGUF→GGUF swapping (no change) and MLX via mlx-lm
+(20% decode, ruined prefill)**. The one untested lever left is upgrading Ollama
+itself — 0.21.2 → 0.32.5, whose own MLX engine is a different animal from raw
+mlx-lm (custom small-batch matmul kernels, prefill snapshots, and v0.31.1's
+"Tightened Gemma 4 MoE model loading in the MLX engine"). It may well not repeat
+mlx-lm's prefill weakness. But it replaces the engine the whole agent depends on
+and is not the "one env var" revert this issue assumed, so it needs Sid's call.
+
+Recommendation: **do not spend more on this issue right now.** The measured
+ceiling from a runtime change looks like ~20% of one stage. `issues/0002`
+(inter-sentence gap) and `issues/0001` (barge-in) are smaller wins that are
+certain, and they are what make the agent *feel* natural.
+
+### Where this now pointed
 Test the same model family through the **MLX runtime** —
 `mlx-community/gemma-4-26B-A4B-it-heretic-4bit` (15.6 GB). `mlx_lm` 0.31.3 is
 already installed via `mlx-audio`, so this needs no dependency change.

@@ -49,9 +49,12 @@ def bench(repo: str, prompt: str, repeat: int, lang: str, max_tokens: int) -> di
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": prompt},
     ]
-    formatted = tokenizer.apply_chat_template(
-        messages, add_generation_prompt=True, tokenize=False
-    )
+    # Tokenize here rather than passing a string: apply_chat_template emits
+    # bos_token, and stream_generate would tokenize the string again and prepend
+    # a second BOS. The doubled BOS made the model ignore the template and open
+    # a <|channel>thought block, which is exactly what `think: false` avoids on
+    # the Ollama side — and it would have made the two runs incomparable.
+    formatted = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
 
     ttft, first_sentence, tok_s, replies = [], [], [], []
 
